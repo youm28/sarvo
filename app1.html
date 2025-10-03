@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Servo Controller - App 1</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="container">
+    <h1>Web Servo Controller</h1>
+    <p id="status">サーバーに接続中...</p>
+    <div class="chip">App ID: 1</div>
+    <h2>DIRECTION</h2>
+    <p id="direction">STOP</p>
+</div>
+
+<script>
+    // ★★★ このアプリのID ★★★
+    const myAppId = 1;
+
+    // PythonサーバーのIPアドレスを指定
+    const serverUrl = "ws://10.40.5.106:5000";
+
+    const statusEl = document.getElementById('status');
+    const directionEl = document.getElementById('direction');
+    let pressedKey = null;
+    let socket;
+
+    function connect() {
+        socket = new WebSocket(serverUrl);
+
+        socket.onopen = function(e) {
+            console.log("接続完了");
+            statusEl.textContent = "接続完了！このウィンドウを選択してキー操作してください。";
+            statusEl.style.color = "#4caf50"; // 緑色
+        };
+
+        socket.onmessage = function(event) {
+            console.log(`サーバーから受信: ${event.data}`);
+        };
+
+        socket.onclose = function(event) {
+            console.log('接続が切れました。再接続を試みます...');
+            statusEl.textContent = "接続が切れました。5秒後に再接続します...";
+            statusEl.style.color = "#f44336"; // 赤色
+            setTimeout(connect, 5000);
+        };
+
+        socket.onerror = function(error) {
+            console.error(`WebSocketエラー: ${error.message}`);
+            statusEl.textContent = "接続エラーが発生しました。";
+            statusEl.style.color = "#f44336";
+        };
+    }
+    
+    // 初回接続
+    connect();
+
+    function sendCommand(commandData) {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify(commandData));
+        }
+    }
+
+    // キーが押されたときの処理
+    window.addEventListener('keydown', function(event) {
+        if (pressedKey) return;
+
+        let direction = "stop";
+        if (event.key === "ArrowUp") direction = "up";
+        if (event.key === "ArrowDown") direction = "down";
+
+        if (direction !== "stop") {
+            pressedKey = event.key;
+            directionEl.textContent = direction.toUpperCase();
+            const command = {
+                "command": "start_" + direction,
+                "app_id": myAppId,
+            };
+            sendCommand(command);
+        }
+    });
+
+    // キーが離されたときの処理
+    window.addEventListener('keyup', function(event) {
+        if (event.key === pressedKey) {
+            pressedKey = null;
+            directionEl.textContent = "STOP";
+            sendCommand({ "command": "stop", "app_id": myAppId });
+        }
+    });
+</script>
+
+</body>
+</html>

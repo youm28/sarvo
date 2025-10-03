@@ -1,0 +1,44 @@
+body {
+    background-color: #1e1e1e;
+    color: white;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    margin: 0;
+    text-align: center;
+}
+
+.container {
+    padding: 40px;
+    border-radius: 12px;
+    background-color: #2d2d2d;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+}
+
+h1, h2, p {
+    margin: 10px 0;
+}
+
+#status {
+    font-size: 1.2em;
+    color: #ffc107; /* 黄色 */
+}
+
+#direction {
+    font-size: 3em;
+    font-weight: bold;
+    color: #03dac6; /* ティール */
+    min-height: 60px;
+}
+
+.chip {
+    display: inline-block;
+    padding: 10px 20px;
+    background-color: #03dac6;
+    color: #1e1e1e;
+    border-radius: 25px;
+    font-size: 1.2em;
+    font-weight: bold;
+}
