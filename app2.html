@@ -22,7 +22,7 @@
 
     // (以降、JavaScript部分はapp1.htmlと全く同じです)
     // PythonサーバーのIPアドレスを指定
-    const serverUrl = "ws://10.40.5.56:5000";
+    const serverUrl = "ws://10.40.5.45:5000";
 
     const statusEl = document.getElementById('status');
     const directionEl = document.getElementById('direction');
@@ -70,8 +70,8 @@
         if (pressedKey) return;
 
         let direction = "stop";
-        if (event.key === "ArrowUp") direction = "up";
-        if (event.key === "ArrowDown") direction = "down";
+        if (event.key === "ArrowRight") direction = "right";
+        if (event.key === "ArrowLeft") direction = "left";
 
         if (direction !== "stop") {
             pressedKey = event.key;

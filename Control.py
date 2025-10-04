@@ -4,7 +4,7 @@ import serial
 import time
 
 # --- シリアルポートの基本設定 ---
-SERIAL_PORT = 'COM8'  # Windowsの場合。'COM4', 'COM5'など環境に合わせて変更
+SERIAL_PORT = 'COM3'  # Windowsの場合。'COM4', 'COM5'など環境に合わせて変更
 
 BAUDRATE = 1250000  # ICSサーボのボーレート
 
