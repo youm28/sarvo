@@ -4,9 +4,9 @@ import serial
 import time
 
 # --- シリアルポートの基本設定 ---
-SERIAL_PORT = 'COM3'  # Windowsの場合。'COM4', 'COM5'など環境に合わせて変更
+SERIAL_PORT = 'COM8'  # Windowsの場合。'COM4', 'COM5'など環境に合わせて変更
 
-BAUDRATE = 115200  # ICSサーボで一般的なボーレート
+BAUDRATE = 1250000  # ICSサーボのボーレート
 
 # グローバルなシリアルポートのインスタンス
 # 複数のサーボで1つのポートを共有します
@@ -17,7 +17,13 @@ def init_serial():
     global ser
     if ser is None or not ser.is_open:
         try:
-            ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.1)
+            ser = serial.Serial(
+                port=SERIAL_PORT,
+                baudrate=BAUDRATE,      # 1250000 のままにする
+                bytesize=8,             # データビット長 (通常8)
+                parity=serial.PARITY_EVEN, # パリティ (通常None)
+                timeout=0.1
+            )
             print(f"シリアルポート {SERIAL_PORT} を開きました。")
         except serial.SerialException as e:
             print(f"エラー: シリアルポート {SERIAL_PORT} を開けませんでした。")

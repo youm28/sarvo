@@ -1,31 +1,29 @@
-# server.py
+# server.py (サーボ1台版)
 
 import asyncio
 import websockets
 import json
-from Control import Control  # Control.pyからControlクラスをインポート
+from Control import Control
 
 # --- サーボの初期化と設定 ---
-# Controlクラスを使って、それぞれのサーボのインスタンス（実体）を作成
+# 右サーボ(ID:7)のみを作成します
 servoRight = Control(physical_id=7, name="Right Servo")
-servoLeft = Control(physical_id=5, name="Left Servo")
 
-# アプリIDと、操作するサーボのインスタンスを対応付ける
+# アプリIDとサーボの対応付けもapp1のみにします
 APP_ID_TO_SERVO_INSTANCE = {
     1: servoRight,
-    2: servoLeft,
 }
 
 # --- 角度や動作の基本設定 ---
 MIN_ANGLE = -60
 MAX_ANGLE = 60
-# アプリIDをキーとして現在の角度を保持
-current_angles = {1: 0, 2: 0} 
+# 角度の保持もapp1のみ
+current_angles = {1: 0} 
 STEP = 1.0
 UPDATE_INTERVAL = 0.02
 
 # --- サーバーの状態管理 ---
-movement_states = {}  # 例: {1: "up", 2: "stop"}
+movement_states = {}
 
 def move_servo_by_app_id(app_id, angle):
     """
@@ -33,8 +31,9 @@ def move_servo_by_app_id(app_id, angle):
     """
     servo_instance = APP_ID_TO_SERVO_INSTANCE.get(app_id)
     if servo_instance:
-        # 実際のサーボの目標角度を計算（-1をかけるなど、ハードウェアに合わせる）
-        target_angle = -1 * angle
+        # Webからの角度は反転させずにそのまま使うことが多いので、
+        # -1倍するかどうかは実際の動きを見て調整してください。
+        target_angle = angle 
         target_angle = max(MIN_ANGLE, min(target_angle, MAX_ANGLE))
         
         servo_instance.move(target_angle)
@@ -47,17 +46,18 @@ async def servo_loop():
             if direction != "stop":
                 angle = current_angles.get(app_id, 0)
                 
-                if direction == "up":
+                if direction == "right":
                     angle += STEP
-                elif direction == "down":
+                elif direction == "left":
                     angle -= STEP
                 
                 angle = max(-60, min(angle, 60))
+                print(f"   -> Servo Loop: App ID {app_id} を {direction}方向に動かします。新しい角度: {angle}")
                 move_servo_by_app_id(app_id, angle)
 
         await asyncio.sleep(UPDATE_INTERVAL)
 
-async def handler(websocket, path):
+async def handler(websocket):
     """クライアントからの指示を受け取るハンドラ"""
     client_app_id = None
     print("クライアントが接続しました。")
@@ -65,11 +65,12 @@ async def handler(websocket, path):
         async for message in websocket:
             try:
                 data = json.loads(message)
+                print(f"受信データ: {data}") # 受信データをログに出力
                 command = data.get("command")
                 app_id = data.get("app_id")
 
                 if app_id not in APP_ID_TO_SERVO_INSTANCE:
-                    print(f"無効なアプリID: {app_id}")
+                    print(f"無効なアプリID: {app_id} (現在app1のみ受付)")
                     continue
                 
                 client_app_id = app_id
@@ -93,8 +94,8 @@ async def handler(websocket, path):
 async def main():
     """サーバーを起動するメイン関数"""
     print("サーバーを起動します...")
+    # サーボの初期位置設定もapp1のみ
     move_servo_by_app_id(1, 0)
-    move_servo_by_app_id(2, 0)
     
     loop = asyncio.get_running_loop()
     loop.create_task(servo_loop())
