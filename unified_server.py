@@ -87,6 +87,7 @@ async def process_kachaka_queue():
     """キューを監視し、ロボットが待機状態なら次の命令を実行する"""
     global kachaka_client
     current_move_future = None
+    idle_start_time = None  # ★ 待機開始時間を記録
     
     while True:
         try:
@@ -97,15 +98,28 @@ async def process_kachaka_queue():
             
             try:
                 is_busy = kachaka_client.is_command_running()
-                queue_length = len(kachaka_command_queue)
+                
+                # ★ ロックの中でキューの長さを確認
+                with kachaka_lock:
+                    queue_length = len(kachaka_command_queue)
                 
                 print(f"🐛 [DEBUG] is_busy: {is_busy}, queue_length: {queue_length}, move_future: {current_move_future is not None}")
+                
+                # ★ デバッグ: キューの内容も表示
+                if queue_length > 0:
+                    with kachaka_lock:
+                        queue_contents = list(kachaka_command_queue)
+                    print(f"🔍 [DEBUG] Queue contents: {queue_contents}")
                 
                 # 現在の移動が完了したかチェック
                 if current_move_future and current_move_future.done():
                     result = current_move_future.result()
                     if result:
                         print("✅ [Kachaka] Move completed successfully")
+                        # ★ 待機開始時間を記録
+                        idle_start_time = time.time()
+                        print(f"⏰ [Kachaka] Starting 10-second wait period at {idle_start_time}")
+                        
                         # 完了通知を送信
                         print("📤 [Status] Preparing to send 'idle' status")
                         await send_status_to_all_clients({
@@ -115,6 +129,8 @@ async def process_kachaka_queue():
                         })
                     else:
                         print("🔥 [Kachaka] Move failed - sending detailed error")
+                        # エラーの場合は待機時間なしで次へ
+                        idle_start_time = None
                         # より詳細なエラー通知を送信
                         await send_status_to_all_clients({
                             "type": "kachaka_status", 
@@ -125,11 +141,27 @@ async def process_kachaka_queue():
                         })
                     current_move_future = None
                 
-                # 新しい移動を開始
-                if not current_move_future and not is_busy and kachaka_command_queue:
+                # ★ 待機時間の確認
+                wait_period_complete = True
+                if idle_start_time is not None:
+                    elapsed_time = time.time() - idle_start_time
+                    remaining_time = 10.0 - elapsed_time
+                    
+                    if remaining_time > 0:
+                        wait_period_complete = False
+                        print(f"⏳ [Kachaka] Waiting... {remaining_time:.1f} seconds remaining")
+                    else:
+                        print("✅ [Kachaka] 10-second wait period completed")
+                        idle_start_time = None  # 待機完了
+                
+                # ★ 新しい移動を開始（待機期間が完了している場合のみ）
+                if not current_move_future and not is_busy and wait_period_complete:
                     with kachaka_lock:
-                        if kachaka_command_queue:  # ダブルチェック
+                        if kachaka_command_queue:  # キューに何かあるかチェック
                             location_data = kachaka_command_queue.popleft()
+                            print(f"📋 [Queue] Popped from queue: {location_data}")
+                            print(f"📋 [Queue] Remaining queue length: {len(kachaka_command_queue)}")
+                            
                             location_id = location_data["id"]
                             location_name = location_data["name"]
                             
@@ -154,17 +186,24 @@ async def process_kachaka_queue():
                                 location_name
                             )
                             print(f"🚀 [Kachaka] Move future created for {location_name}")
+                        else:
+                            print(f"🔍 [DEBUG] Queue is empty - nothing to process")
+                elif not wait_period_complete:
+                    # 待機中であることをログに記録
+                    pass  # 上で既にログ出力済み
                 
             except Exception as kachaka_error:
                 print(f"🔥 [Kachaka] Client operation error: {kachaka_error}")
                 kachaka_client = None
                 current_move_future = None
+                idle_start_time = None  # ★ エラー時は待機をリセット
                 await asyncio.sleep(5)
                 continue
                 
         except Exception as e:
             print(f"🔥 Error in process_kachaka_queue: {e}")
             current_move_future = None
+            idle_start_time = None  # ★ エラー時は待機をリセット
             await asyncio.sleep(5)
         
         await asyncio.sleep(0.5)  # より短い間隔でチェック
@@ -213,8 +252,10 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
                     with kachaka_lock:
                         kachaka_command_queue.append({"id": location_id, "name": location_name})
                         queue_length = len(kachaka_command_queue)
-                    
-                    print(f"📋 [Queue] Added '{location_name}' to queue. New length: {queue_length}")
+                        # ★ デバッグ: 追加後のキューの内容を表示
+                        queue_contents = list(kachaka_command_queue)
+                        print(f"📋 [Queue] Added '{location_name}' to queue. New length: {queue_length}")
+                        print(f"📋 [Queue] Current queue contents: {queue_contents}")
                     
                     # 全クライアントにキューイング通知
                     print(f"📤 [Status] Preparing to send 'queued' status for {location_name}")
