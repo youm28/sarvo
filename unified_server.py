@@ -2,100 +2,119 @@ import asyncio
 import json
 from collections import deque
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
-# Control.py から Control クラスをインポート
-# unified_server.py と Control.py は同じフォルダにある必要があります
 from Control import Control
+import kachaka_api  # 本物のKachaka APIをインポート
+
+# --- ★★★ ご自身のKachakaロボットのIPアドレスに変更してください ★★★ ---
+KACHAKA_IP = "10.40.5.97"
 
 # --- FastAPIアプリケーションのインスタンスを作成 ---
 app = FastAPI()
+kachaka_client: kachaka_api.KachakaApiClient = None # グローバルなクライアント変数
 
 # =================================================================
 # Section 1: Kachaka ロボット制御関連のコード
 # =================================================================
-
-# --- この部分は実際のKachaka gRPCライブラリに置き換えます ---
-# デモ用のモック（偽の）ロボットクラス
-class MockKachakaRobot:
-    def __init__(self):
-        self.is_busy = False
-
-    async def move_to_location(self, location_id):
-        self.is_busy = True
-        print(f"🤖 [Kachaka] ロボットが {location_id} へ移動開始...")
-        await asyncio.sleep(10) # 10秒間の移動をシミュレート
-        self.is_busy = False
-        print(f"🤖 [Kachaka] ロボットが到着し、待機状態になりました。")
-
-# --- Kachaka関連の状態管理 ---
-kachaka_robot = MockKachakaRobot()
-kachaka_command_queue = deque() # Kachakaの命令をためるためのキュー
-kachaka_clients = set() # Kachakaに接続中のクライアント
+kachaka_command_queue = deque()
+kachaka_clients = set()
 
 async def process_kachaka_queue():
-    """Kachakaのキューを継続的に監視し、ロボットが空いていれば命令を処理する"""
+    """キューを監視し、ロボットが待機状態なら次の命令を実行する"""
+    global kachaka_client
     while True:
-        if not kachaka_robot.is_busy and kachaka_command_queue:
-            location_id = kachaka_command_queue.popleft()
+        try:
+            if not kachaka_client:
+                print("🔥 [DEBUG] Kachaka client is None")
+                await asyncio.sleep(1)
+                continue
             
-            # 全クライアントにロボットが移動中であることを通知
-            for client in kachaka_clients:
-                await client.send_json({"status": "moving", "destination": location_id})
+            # デバッグ情報を追加 - awaitを削除
+            is_busy = kachaka_client.is_command_running()
+            queue_length = len(kachaka_command_queue)
             
-            await kachaka_robot.move_to_location(location_id)
+            print(f"🐛 [DEBUG] is_busy: {is_busy}, queue_length: {queue_length}")
             
-            # ロボットが待機状態になったことを全クライアントに通知
-            for client in kachaka_clients:
-                await client.send_json({"status": "idle"})
+            if not is_busy and kachaka_command_queue:
+                location_data = kachaka_command_queue.popleft()
+                location_id = location_data["id"]
+                location_name = location_data["name"]
+                
+                print(f"🤖 [Kachaka] Sending command to robot: Move to {location_name} ({location_id})")
+                
+                # 全クライアントにロボットが移動中であることを通知
+                for client in kachaka_clients:
+                    await client.send_json({"type": "kachaka_status", "status": "moving", "destination": location_name})
+                
+                # ★★★ 本物のロボットに移動命令を送信 ★★★
+                try:
+                    await kachaka_client.move_to_location(location_id)
+                    print(f"✅ [Kachaka] Command sent successfully")
+                except Exception as move_error:
+                    print(f"🔥 [Kachaka] Failed to send move command: {move_error}")
+                    # 失敗した場合、キューに戻すかエラー通知
+                    for client in kachaka_clients:
+                        await client.send_json({"type": "kachaka_status", "status": "error", "message": str(move_error)})
+            elif is_busy:
+                print(f"🤖 [DEBUG] Robot is busy, waiting...")
+            elif not kachaka_command_queue:
+                print(f"🤖 [DEBUG] Queue is empty")
+                
+        except Exception as e:
+            print(f"🔥 Error in process_kachaka_queue: {e}")
+            await asyncio.sleep(5)
         
-        await asyncio.sleep(1) # 1秒ごとにチェック
+        await asyncio.sleep(1)
 
-# --- Kachaka用のWebSocketエンドポイント ---
+async def broadcast_robot_status():
+    """ロボットの状態を定期的に全クライアントにブロードキャストする"""
+    global kachaka_client
+    last_is_busy = False
+    while True:
+        try:
+            if kachaka_client:
+                # awaitを削除
+                is_busy = kachaka_client.is_command_running()
+                # 状態が「実行中」から「待機」に変わった瞬間を検知
+                if last_is_busy and not is_busy:
+                    print("🤖 [Kachaka] Command finished, robot is now idle.")
+                    for client in kachaka_clients:
+                        await client.send_json({"type": "kachaka_status", "status": "idle"})
+                last_is_busy = is_busy
+        except Exception as e:
+            print(f"🔥 Error in broadcast_robot_status: {e}")
+        await asyncio.sleep(1) # 1秒ごとに状態を確認
+
 @app.websocket("/ws/kachaka")
 async def websocket_kachaka_endpoint(websocket: WebSocket):
     await websocket.accept()
     kachaka_clients.add(websocket)
-    print(f"✅ [Kachaka] Flutterクライアントが接続しました。")
+    print(f"✅ [Kachaka] Flutter client connected.")
     try:
         while True:
             data = await websocket.receive_json()
-            # クライアントから移動リクエストを受け取った場合
             if data.get("action") == "MOVE":
                 location_id = data.get("location_id")
-                if location_id:
-                    kachaka_command_queue.append(location_id)
-                    # コマンドがキューに追加されたことを全クライアントに通知
+                location_name = data.get("location_name")
+                if location_id and location_name:
+                    kachaka_command_queue.append({"id": location_id, "name": location_name})
                     for client in kachaka_clients:
                        await client.send_json({
+                           "type": "kachaka_status",
                            "status": "queued",
                            "queue_length": len(kachaka_command_queue)
                         })
     except WebSocketDisconnect:
         kachaka_clients.remove(websocket)
-        print(f"❌ [Kachaka] Flutterクライアントの接続が切れました。")
-
+        print(f"❌ [Kachaka] Flutter client disconnected.")
 
 # =================================================================
-# Section 2: サーボモーター制御関連のコード
+# Section 2: Servo Motor Control (変更なし)
 # =================================================================
-
-# --- サーボの初期化と設定 ---
 servoRight = Control(physical_id=7, name="Right Servo")
 servoLeft = Control(physical_id=5, name="Left Servo")
-
-APP_ID_TO_SERVO_INSTANCE = {
-    1: servoRight,
-    2: servoLeft,
-}
-
-# --- 角度や動作の基本設定 ---
-MIN_ANGLE = -60
-MAX_ANGLE = 60
-current_angles = { 1: 0, 2: 0 }
-STEP = 1.0
-UPDATE_INTERVAL = 0.01
-
-# --- サーボの状態管理 ---
+APP_ID_TO_SERVO_INSTANCE = {1: servoRight, 2: servoLeft}
+MIN_ANGLE, MAX_ANGLE, STEP, UPDATE_INTERVAL = -60, 60, 1.0, 0.01
+current_angles = {1: 0, 2: 0}
 movement_states = {}
 
 def move_servo_by_app_id(app_id, angle):
@@ -106,7 +125,6 @@ def move_servo_by_app_id(app_id, angle):
         current_angles[app_id] = target_angle
 
 async def servo_loop():
-    """サーボの角度を継続的に更新するループ"""
     while True:
         for app_id, direction in list(movement_states.items()):
             if direction != "stop":
@@ -116,69 +134,81 @@ async def servo_loop():
                 move_servo_by_app_id(app_id, angle)
         await asyncio.sleep(UPDATE_INTERVAL)
 
-# --- サーボ制御用のWebSocketエンドポイント ---
 @app.websocket("/ws/servo")
 async def websocket_servo_endpoint(websocket: WebSocket):
     await websocket.accept()
     client_app_id = None
-    print(f"✅ [Servo] Webクライアントが接続しました。")
+    print(f"✅ [Servo] Web client connected.")
     try:
-        # ★★★ ここからが修正箇所 ★★★
         while True:
-            # クライアントからのメッセージをJSON形式で待機
             data = await websocket.receive_json()
-        # ★★★ ここまでが修正箇所 ★★★
-            
-            # 以降の処理は try のインデントを一つ浅くする
             try:
                 command = data.get("command")
                 app_id = data.get("app_id")
-
                 if app_id not in APP_ID_TO_SERVO_INSTANCE:
-                    print(f"⚠️ [Servo] 無効なアプリID: {app_id}")
+                    print(f"⚠️ [Servo] Invalid App ID: {app_id}")
                     continue
-                
                 client_app_id = app_id
-
                 if command and command.startswith("start_"):
                     direction = command.split("_")[1]
                     movement_states[app_id] = direction
                 elif command == "stop":
                     movement_states[app_id] = "stop"
-
             except Exception as e:
-                print(f"🔥 [Servo] 処理エラー: {e}")
-
+                print(f"🔥 [Servo] Processing error: {e}")
     except WebSocketDisconnect:
-        print(f"❌ [Servo] Webクライアント (App ID: {client_app_id}) との接続が切れました。")
+        print(f"❌ [Servo] Web client (App ID: {client_app_id}) disconnected.")
     finally:
-        # 接続が切れたら、そのクライアントのサーボの動きを止める
         if client_app_id:
             movement_states[client_app_id] = "stop"
-            print(f"🛑 [Servo] App ID: {client_app_id} の動作を停止しました。")
+            print(f"🛑 [Servo] Stopped movement for App ID: {client_app_id}")
 
 # =================================================================
-# Section 3: サーバーの起動設定
+# Section 3: Server Startup
 # =================================================================
+async def retry_kachaka_connection():
+    """Kachaka接続を定期的に再試行する"""
+    global kachaka_client
+    while kachaka_client is None:
+        try:
+            print(f"🔄 Retrying connection to Kachaka robot at {KACHAKA_IP}...")
+            kachaka_client = kachaka_api.KachakaApiClient(f"{KACHAKA_IP}:26400")
+            robot_version = await kachaka_client.get_robot_version()
+            print(f"✅ Reconnected to Kachaka robot! Version: {robot_version}")
+            break
+        except Exception as e:
+            print(f"🔥 Retry failed: {e}")
+            await asyncio.sleep(10)  # 10秒待ってから再試行
 
 @app.on_event("startup")
 async def startup_event():
-    """サーバー起動時に実行される処理"""
-    print("🚀 統合サーバーを起動します...")
-    # 1. 両方のサーボを初期位置(0度)に設定
-    print("🔩 [Servo] サーボを初期位置に設定します。")
+    global kachaka_client
+    print("🚀 Starting unified server...")
+
+    print(f"🔌 Connecting to Kachaka robot at {KACHAKA_IP}...")
+    try:
+        kachaka_client = kachaka_api.KachakaApiClient(f"{KACHAKA_IP}:26400")
+        robot_version = await kachaka_client.get_robot_version()
+        print(f"✅ Connected to Kachaka robot! Version: {robot_version}")
+    except Exception as e:
+        print(f"🔥 FAILED to connect to Kachaka robot: {e}")
+        kachaka_client = None
+        # バックグラウンドで再接続を試行
+        asyncio.create_task(retry_kachaka_connection())
+
+    print("🔩 [Servo] Initializing servos to position 0.")
     move_servo_by_app_id(1, 0)
     move_servo_by_app_id(2, 0)
     
-    # 2. バックグラウンドタスクを開始
+    # バックグラウンドタスクを開始
     asyncio.create_task(process_kachaka_queue())
     asyncio.create_task(servo_loop())
-    print("🛰️  バックグラウンドタスク（Kachakaキュー, Servoループ）を開始しました。")
-    print("✅ サーバーの準備が完了しました。")
+    asyncio.create_task(broadcast_robot_status())
+    
+    print("🛰️  Background tasks started.")
+    print("✅ Server is ready.")
 
-# このファイルが直接実行されたときにサーバーを起動するためのコード
 if __name__ == "__main__":
     import uvicorn
-    # 0.0.0.0 を指定することで、同じネットワーク内の他のPCからアクセス可能になります
-    # port=8000 を指定して、8000番ポートで待ち受けます
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
