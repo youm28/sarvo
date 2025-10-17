@@ -21,15 +21,14 @@ kachaka_clients = set()
 kachaka_lock = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=1)
 
-# ★ 状態管理変数を拡張
+# 状態管理変数
 user_assignments = {}
 destination_requests = {}
-proposed_plan = {}          # {"first": ..., "second": ...}
-plan_confirmations = set()  # {"user_1", "user_2"}
+proposed_plan = {}
+plan_confirmations = set()
 
 
 def kachaka_move_sync(location_id, location_name):
-    """同期的なKachaka移動処理（別スレッドで実行）"""
     global kachaka_client
     try:
         print(f"🤖 [Kachaka Thread] Starting move to {location_name} ({location_id})")
@@ -42,9 +41,7 @@ def kachaka_move_sync(location_id, location_name):
 
 
 async def send_status_to_all_clients(status_data):
-    """全クライアントに状態を送信するヘルパー関数"""
-    if not kachaka_clients:
-        return
+    if not kachaka_clients: return
     disconnected_clients = []
     for client in list(kachaka_clients):
         try:
@@ -56,41 +53,70 @@ async def send_status_to_all_clients(status_data):
     print(f"📤 [Broadcast] Sent to {len(kachaka_clients)} clients: {status_data}")
 
 
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# ★ START: この関数を全面的に書き換え               ★
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 async def process_destination_requests():
-    """2人分のリクエストが揃ったら距離を計算し、プランを提案する"""
+    """2つの目的地を巡る最短ルートを計算し、プランを提案する"""
     global destination_requests, proposed_plan, plan_confirmations
 
     if len(destination_requests) < 2:
         return
 
-    print("✅ [Decision] Two requests received. Starting calculation.")
+    print("✅ [Decision] Two requests received. Calculating shortest overall route.")
+    
+    # --- 必要な情報を抽出 ---
     user1_req = destination_requests["user_1"]
     user2_req = destination_requests["user_2"]
-    robot_pose = user1_req["robot_pose"]
-
-    dist1 = math.dist([robot_pose["x"], robot_pose["y"]], [user1_req["location"]["pose"]["x"], user1_req["location"]["pose"]["y"]])
-    dist2 = math.dist([robot_pose["x"], robot_pose["y"]], [user2_req["location"]["pose"]["x"], user2_req["location"]["pose"]["y"]])
-
-    if dist1 <= dist2:
-        first = user1_req["location"]
-        second = user2_req["location"]
+    
+    loc_A_data = user1_req["location"]
+    loc_B_data = user2_req["location"]
+    
+    pose_robot = user1_req["robot_pose"]
+    pose_A = loc_A_data["pose"]
+    pose_B = loc_B_data["pose"]
+    
+    # --- 3点間の距離を計算 ---
+    # math.distは2点間のユークリッド距離を計算する
+    dist_robot_to_A = math.dist([pose_robot["x"], pose_robot["y"]], [pose_A["x"], pose_A["y"]])
+    dist_robot_to_B = math.dist([pose_robot["x"], pose_robot["y"]], [pose_B["x"], pose_B["y"]])
+    dist_A_to_B = math.dist([pose_A["x"], pose_A["y"]], [pose_B["x"], pose_B["y"]])
+    
+    # --- 2つのルートの総移動距離を計算 ---
+    # ルート1: 現在地 → A → B
+    total_dist_route1 = dist_robot_to_A + dist_A_to_B
+    
+    # ルート2: 現在地 → B → A
+    total_dist_route2 = dist_robot_to_B + dist_A_to_B # dist_A_to_B と dist_B_to_A は同じ
+    
+    print(f"📏 [RouteCalc] Route 1 (-> {loc_A_data['name']} -> {loc_B_data['name']}): {total_dist_route1:.2f}m")
+    print(f"📏 [RouteCalc] Route 2 (-> {loc_B_data['name']} -> {loc_A_data['name']}): {total_dist_route2:.2f}m")
+    
+    # --- 総移動距離が短いルートを選択 ---
+    if total_dist_route1 <= total_dist_route2:
+        first = loc_A_data
+        second = loc_B_data
+        print(f"🏆 [Decision] Route 1 is shorter.")
     else:
-        first = user2_req["location"]
-        second = user1_req["location"]
+        first = loc_B_data
+        second = loc_A_data
+        print(f"🏆 [Decision] Route 2 is shorter.")
 
-    # ★ 提案を作成して保持し、同意状態をリセット
+    # 提案を作成して保持し、同意状態をリセット
     proposed_plan["first"] = first
     proposed_plan["second"] = second
     plan_confirmations.clear()
-    print(f"🏆 [Decision] Proposal created: 1st='{first['name']}', 2nd='{second['name']}'")
-
-    # ★ 全クライアントにプランを提案
-    proposal_message = f"'{first['name']}'の方が距離が近いので、先にそちらへ行きましょう！"
+    
+    # 全クライアントにプランを提案
+    proposal_message = f"先に「{first['name']}」へ向かうのが最短ルートです。この順番で行きましょう！"
     await send_status_to_all_clients({
         "type": "PROPOSE_PLAN",
         "message": proposal_message,
     })
     print(f"📢 [Proposal] Sent: {proposal_message}")
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# ★ END: この関数を全面的に書き換え                 ★
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
 
 async def process_kachaka_queue():
@@ -155,7 +181,6 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
                     else:
                         await send_status_to_all_clients({"type": "WAITING_FOR_OPPONENT", "message": "相手の選択を待っています…"})
 
-            # ★ 同意アクションを処理
             elif action == "CONFIRM_PLAN":
                 if user_id in ["user_1", "user_2"]:
                     print(f"👍 [Confirm] Received from {user_id}")
@@ -169,7 +194,6 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
                             if proposed_plan:
                                 kachaka_command_queue.append(proposed_plan["first"])
                                 kachaka_command_queue.append(proposed_plan["second"])
-                        # 状態をリセット
                         destination_requests.clear()
                         plan_confirmations.clear()
                         proposed_plan.clear()
@@ -180,7 +204,6 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
         disconnected_user_id = user_assignments.pop(websocket, None)
         kachaka_clients.discard(websocket)
         if disconnected_user_id:
-            # ★ 切断時にすべての状態をリセット
             destination_requests.clear()
             plan_confirmations.clear()
             proposed_plan.clear()
@@ -188,7 +211,7 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
             await send_status_to_all_clients({"type": "user_disconnected", "message": f"ユーザーが切断したため、リセットされました。"})
         print(f"❌ [Disconnect] Client disconnected. Remaining: {len(kachaka_clients)}")
 
-# (Section 2: Servo, Section 3: Server Startup は変更ありません)
+# (Section 2: Servo と Section 3: Server Startup は変更ありません)
 # =================================================================
 # Section 2: Servo Motor Control (変更なし)
 # =================================================================
