@@ -247,19 +247,30 @@ def servo_thread_loop():
                 # 対象のサーボインスタンスを探す
                 target_servo = None
                 # 全探索
-                if physical_id == 5: target_servo = servoHorizontalRight
-                elif physical_id == 7: target_servo = servoVerticalRight
-                elif physical_id == 13: target_servo = servoHorizontalLeft
-                elif physical_id == 9: target_servo = servoVerticalLeft
+                if physical_id == 7: target_servo = servoHorizontalRight
+                elif physical_id == 5: target_servo = servoVerticalRight
+                elif physical_id == 9: target_servo = servoHorizontalLeft
+                elif physical_id == 13: target_servo = servoVerticalLeft
                 
                 if target_servo:
                     current_angle = current_angles.get(physical_id, 0)
                     step = 0.4  # 移動速度
                     
+                    
+                    # 垂直方向のサーボ（ID 7 または 9）かどうかを判定
+                    is_vertical = (physical_id == 7 or physical_id == 9)
+
                     if direction == "increase":
-                        current_angle += step
+                        if is_vertical:
+                            current_angle -= step  # 【反転】垂直なら引く
+                        else:
+                            current_angle += step  # 水平なら足す（通常通り）
+                            
                     elif direction == "decrease":
-                        current_angle -= step
+                        if is_vertical:
+                            current_angle += step  # 【反転】垂直なら足す
+                        else:
+                            current_angle -= step  # 水平なら引く（通常通り）
                     
                     move_servo(physical_id, target_servo, current_angle)
                     
@@ -306,6 +317,27 @@ async def websocket_servo_endpoint(websocket: WebSocket):
 async def startup_event():
     global kachaka_client
     print("🚀 Server Starting (Direct Destination Mode)...")
+
+    print("⚙️ Initializing Servos to Origin (0)...")
+    try:
+        # 定義されている全サーボをリスト化
+        initial_servos = [
+            (5, servoHorizontalRight),
+            (7, servoVerticalRight),
+            (13, servoHorizontalLeft),
+            (9, servoVerticalLeft)
+        ]
+        
+        # 順番に0度へ移動させる
+        for p_id, servo in initial_servos:
+            move_servo(p_id, servo, 0)
+            
+        # 念のため物理的な移動時間を待つ
+        time.sleep(0.5)
+        
+    except Exception as e:
+        print(f"⚠️ Servo Init Error: {e}")
+        
     threading.Thread(target=servo_thread_loop, daemon=True).start()
     try:
         kachaka_client = kachaka_api.KachakaApiClient(f"{KACHAKA_IP}:26400")
