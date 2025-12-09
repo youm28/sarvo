@@ -7,10 +7,148 @@ import kachaka_api
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import csv
+import os
+from datetime import datetime
 
 KACHAKA_IP = "10.40.5.108"
 app = FastAPI()
 kachaka_client: kachaka_api.KachakaApiClient = None
+
+# =================================================================
+# ★★★ METRICS & LOGGING SETUP (ユーザー別集計に対応) ★★★
+# =================================================================
+log_lock = threading.Lock()
+current_time_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+LOG_FILENAME = f"baseline_metrics_{current_time_str}.csv"  # ファイル名をbaseline用に変更
+
+class MetricsTracker:
+    def __init__(self):
+        # 時間計測用
+        self.t_start_selection = time.time()
+        self.t_dest_selected = None
+        self.t_start_move = None
+
+        # サーボ集計用
+        self.servo_active_presses = {} # {user_id_axis: start_time}
+        self.current_phase = "IDLE"    # "IDLE" or "MOVING"
+        
+        # ユーザー別に集計バッファを分離
+        self.servo_stats = {
+            "IDLE": {
+                "user_1": {"count": 0, "duration": 0.0},
+                "user_2": {"count": 0, "duration": 0.0}
+            },
+            "MOVING": {
+                "user_1": {"count": 0, "duration": 0.0},
+                "user_2": {"count": 0, "duration": 0.0}
+            }
+        }
+
+    def reset_selection_timer(self):
+        self.t_start_selection = time.time()
+        self.t_dest_selected = None
+
+    def mark_dest_selected(self):
+        self.t_dest_selected = time.time()
+        duration = self.t_dest_selected - self.t_start_selection
+        return round(duration, 3)
+
+    def mark_route_selected(self):
+        if self.t_dest_selected is None: return 0, 0
+        now = time.time()
+        route_time = now - self.t_dest_selected
+        total_time = now - self.t_start_selection
+        return round(route_time, 3), round(total_time, 3)
+
+    def start_travel(self):
+        self.t_start_move = time.time()
+        self.switch_phase("MOVING")
+
+    def end_travel(self):
+        if self.t_start_move is None: return 0
+        duration = time.time() - self.t_start_move
+        self.t_start_move = None
+        self.switch_phase("IDLE") 
+        self.reset_selection_timer()
+        return round(duration, 3)
+
+    def switch_phase(self, new_phase):
+        """フェーズ切り替え時に、前のフェーズの集計をユーザーごとにログ出力"""
+        if self.current_phase == new_phase: return
+
+        # 前のフェーズのデータ
+        phase_data = self.servo_stats[self.current_phase]
+        
+        # ユーザーごとにログを出力
+        for user_id in ["user_1", "user_2"]:
+            stats = phase_data.get(user_id)
+            if stats:
+                log_event(
+                    user_id, # User_IDカラムに記録
+                    f"SERVO_SUMMARY_{self.current_phase}", 
+                    str(stats["count"]), 
+                    str(round(stats["duration"], 3))
+                )
+                print(f"📊 Summary ({self.current_phase}) [{user_id}]: {stats['count']} clicks, {stats['duration']:.2f} sec")
+                
+                # リセット
+                stats["count"] = 0
+                stats["duration"] = 0.0
+
+        self.current_phase = new_phase
+
+    def record_servo_input(self, user_id, axis, command):
+        """サーボ入力の開始と終了を検知して集計（ユーザー別）"""
+        if user_id not in ["user_1", "user_2"]: return 
+
+        key = f"{user_id}_{axis}"
+        now = time.time()
+        
+        # 対象ユーザーの統計辞書を取得
+        stats = self.servo_stats[self.current_phase][user_id]
+
+        if command in ["increase", "decrease"]:
+            # 押し込み開始
+            if key not in self.servo_active_presses:
+                self.servo_active_presses[key] = now
+                stats["count"] += 1
+        
+        elif command == "stop":
+            # 押し込み終了
+            start_time = self.servo_active_presses.pop(key, None)
+            if start_time:
+                duration = now - start_time
+                stats["duration"] += duration
+
+metrics = MetricsTracker()
+
+def init_log_file():
+    if not os.path.exists(LOG_FILENAME):
+        with open(LOG_FILENAME, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Timestamp", "User_ID", "Action_Type", 
+                "Value_1", "Value_2", 
+                "Current_Selector", "Robot_Location"
+            ])
+    print(f"📝 Logging started: {LOG_FILENAME}")
+
+def log_event(user_id, action_type, val1="", val2=""):
+    try:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        with log_lock:
+            with open(LOG_FILENAME, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    timestamp, user_id, action_type, val1, val2,
+                    current_destination_selector, current_location_name
+                ])
+    except Exception as e:
+        print(f"🔥 Log Error: {e}")
+
+init_log_file()
+
 
 # =================================================================
 # Section 1: Kachaka ロボット制御関連
@@ -143,6 +281,10 @@ async def process_destination_and_route():
         else:
             message = f"{destination_name} へ直接向かいます！"
         
+        # ★ METRICS: 移動開始
+        metrics.start_travel()
+        log_event("SYSTEM", "START_MOVING", f"To: {destination_name}", f"Route: {route_selection}")
+        
         await send_status_to_all_clients({"type": "STARTING_MOVE", "message": message})
         await asyncio.sleep(1)
         
@@ -202,14 +344,24 @@ async def process_kachaka_queue():
                     print(f"📍 [Update] Location changed: '{old_loc}' -> '{new_loc}'")
                 
                 current_moving_location = None
+
+                # ★ METRICS: 最終到着判定（キュー空）
+                if not kachaka_command_queue:
+                    travel_time = metrics.end_travel()
+                    log_event("SYSTEM", "TIME_TRAVEL", str(travel_time), f"To: {current_location_name}")
                 
                 swap_triggers = ["1", "2", "3", "4", "5", "6"]
                 
                 if current_location_name in swap_triggers:
+                    prev_selector = current_destination_selector
                     current_destination_selector = "user_2" if current_destination_selector == "user_1" else "user_1"
                     print(f"🔄 [Role Swap] Arrived at {current_location_name}. Destination Selector is now: {current_destination_selector}")
+                    
+                    # ★ LOG: 役割交代
+                    log_event("SYSTEM", "ROLE_SWAP", f"At: {current_location_name}", f"{prev_selector}->{current_destination_selector}")
                 else:
                     print(f"➡️ [Continue] Arrived at {current_location_name} (Waypoint). No role swap.")
+                    log_event("SYSTEM", "WAYPOINT_ARRIVED", f"At: {current_location_name}", "")
 
                 await send_status_to_all_clients({
                     "type": "kachaka_status", 
@@ -249,6 +401,10 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
         else: user_id = "spectator"
         user_assignments[websocket] = user_id
     
+    # ★ METRICS: 接続時タイマーリセット
+    metrics.reset_selection_timer()
+    log_event(user_id, "CONNECT", "Kachaka WS", "")
+
     print(f"✅ [Connect] {user_id}. Sending Location: {current_location_name}")
     
     init_msg = ""
@@ -287,25 +443,28 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "ERROR", "message": "処理中です。"})
                     continue
                 
+                dest_name = data.get("location")["name"]
+                
+                # ★ METRICS: 目的地選択時間
+                dest_time = metrics.mark_dest_selected()
+                log_event(user_id, "TIME_DEST_SELECT", str(dest_time), dest_name)
+                
                 destination_requests[user_id] = {"location": data.get("location")}
                 
-                dest_name = data.get("location")["name"]
                 route_key = (current_location_name, dest_name)
                 available_routes = ROUTE_PATTERNS.get(route_key, DEFAULT_ROUTE)
 
-                # ★変更: Selector(自分)に経路選択を要求する
+                # Baselineでは自分自身に経路選択を求める
                 await send_status_to_all_clients({
                     "type": "WAITING_FOR_ROUTE", 
                     "message": f"目的地「{dest_name}」選択済。経路を選択してください。", 
-                    "for_user": user_id, # 自分自身を指定
+                    "for_user": user_id, 
                     "route_options": available_routes,
                     "target_destination": dest_name 
                 })
-                # 自分へのレスポンスも「経路を選んで」に変更
                 await websocket.send_json({"type": "WAITING_FOR_ROUTE", "message": "経路を選択してください。"})
 
             elif action == "SELECT_ROUTE":
-                # ★変更: 目的地を選んだ人(Selector)だけが経路を選べる
                 if user_id != current_destination_selector:
                     await websocket.send_json({"type": "ERROR", "message": "あなたは経路選択の担当ではありません。"})
                     continue
@@ -314,12 +473,17 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "ERROR", "message": "移動中です。"})
                     continue
                 
-                # 自分の目的地リクエストがあるか確認
                 if current_destination_selector not in destination_requests:
                     await websocket.send_json({"type": "ERROR", "message": "先に目的地を選んでください。"})
                     continue
 
                 route_selection = data.get("route")
+                
+                # ★ METRICS: 経路選択時間 & 合計選択時間
+                route_time, total_time = metrics.mark_route_selected()
+                log_event(user_id, "TIME_ROUTE_SELECT", str(route_time), route_selection)
+                log_event("SYSTEM", "TIME_TOTAL_SELECT", str(total_time), "")
+                
                 await process_destination_and_route()
 
     except WebSocketDisconnect:
@@ -327,6 +491,7 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
         kachaka_clients.discard(websocket)
         if u_id:
             destination_requests.clear(); route_selection = None
+            log_event(u_id, "DISCONNECT", "Kachaka WS", "")
             print(f"❌ [Disconnect] {u_id}")
             await send_status_to_all_clients({"type": "user_disconnected", "message": "リセットされました"})
             await broadcast_connection_status()
@@ -336,14 +501,11 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
 # =================================================================
 
 # 定義
-# Right Set (User 1)
 servoHorizontalRight = Control(physical_id=5, name="HRight Servo")
 servoVerticalRight = Control(physical_id=7, name="VRight Servo")
-# Left Set (User 2)
 servoHorizontalLeft = Control(physical_id=13, name="HLeft Servo")
 servoVerticalLeft = Control(physical_id=9, name="VLeft Servo")
 
-# ユーザーIDとサーボのマッピング（固定）
 USER_SERVO_MAP = {
     "user_1": {
         "horizontal": servoHorizontalRight,
@@ -355,17 +517,13 @@ USER_SERVO_MAP = {
     }
 }
 
-# 物理IDごとの現在の角度
 current_angles = {5: 0, 7: 0, 13: 0, 9: 0}
-# 物理IDごとの動作状態 ('stop', 'increase', 'decrease')
 movement_states = {5: "stop", 7: "stop", 13: "stop", 9: "stop"}
-
 servo_lock = threading.Lock()
 
 def move_servo(physical_id, servo_instance, angle):
     with servo_lock:
         if servo_instance:
-            # 角度制限 (-40 ~ 40度)
             angle = max(-40, min(angle, 40))
             servo_instance.move(angle)
             current_angles[physical_id] = angle
@@ -374,15 +532,10 @@ def servo_thread_loop():
     while True:
         try:
             with servo_lock:
-                # 辞書をコピーして反復処理中の変更を防ぐ
                 states = dict(movement_states)
-            
-            # 全サーボの状態を見て動かす
             for physical_id, direction in states.items():
-                if direction == "stop":
-                    continue
+                if direction == "stop": continue
                 
-                # 対象のサーボインスタンスを探す
                 target_servo = None
                 if physical_id == 7: target_servo = servoHorizontalRight
                 elif physical_id == 5: target_servo = servoVerticalRight
@@ -391,29 +544,18 @@ def servo_thread_loop():
                 
                 if target_servo:
                     current_angle = current_angles.get(physical_id, 0)
-                    step = 0.4  # 移動速度
-                    
-                    # 垂直方向のサーボ（ID 7 または 9）かどうかを判定
+                    step = 0.4 
                     is_vertical = (physical_id == 7 or physical_id == 9)
-
                     if direction == "increase":
-                        if is_vertical:
-                            current_angle -= step  # 【反転】垂直なら引く
-                        else:
-                            current_angle += step  # 水平なら足す（通常通り）
-                            
+                        if is_vertical: current_angle -= step 
+                        else: current_angle += step 
                     elif direction == "decrease":
-                        if is_vertical:
-                            current_angle += step  # 【反転】垂直なら足す
-                        else:
-                            current_angle -= step  # 水平なら引く（通常通り）
-                    
+                        if is_vertical: current_angle += step 
+                        else: current_angle -= step 
                     move_servo(physical_id, target_servo, current_angle)
-                    
         except Exception as e:
             print(f"Servo Loop Error: {e}")
-            
-        time.sleep(0.01) # 100Hz制御
+        time.sleep(0.01)
 
 @app.websocket("/ws/servo")
 async def websocket_servo_endpoint(websocket: WebSocket):
@@ -422,18 +564,15 @@ async def websocket_servo_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_json()
-            
-            # デバッグ用
-            # print(f"📨 Servo Command: {data}")
-
             user_id = data.get("user_id")
             axis = data.get("axis") 
             command = data.get("command") 
 
-            if user_id not in USER_SERVO_MAP:
-                # print(f"⚠️ Unknown User: {user_id}")
-                continue
+            # ★ METRICS: サーボ操作の集計 (逐一ログは停止)
+            metrics.record_servo_input(user_id, axis, command)
+            # log_event(user_id, "SERVO_INPUT", axis, command)
 
+            if user_id not in USER_SERVO_MAP: continue
             target_servos = USER_SERVO_MAP[user_id]
             target_servo = target_servos.get(axis)
             
@@ -450,24 +589,18 @@ async def websocket_servo_endpoint(websocket: WebSocket):
 @app.on_event("startup")
 async def startup_event():
     global kachaka_client
-    print("🚀 Server Starting (Single User Select Mode)...")
+    print("🚀 Server Starting (Baseline - Single User Select Mode)...")
     print("⚙️ Initializing Servos to Origin (0)...")
     try:
-        # 定義されている全サーボをリスト化
         initial_servos = [
             (5, servoHorizontalRight),
             (7, servoVerticalRight),
             (13, servoHorizontalLeft),
             (9, servoVerticalLeft)
         ]
-        
-        # 順番に0度へ移動させる
         for p_id, servo in initial_servos:
             move_servo(p_id, servo, 0)
-            
-        # 念のため物理的な移動時間を待つ
         time.sleep(0.5)
-        
     except Exception as e:
         print(f"⚠️ Servo Init Error: {e}")
         
