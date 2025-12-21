@@ -169,6 +169,10 @@ route_selection = None
 current_location_name = "充電ドック" 
 current_moving_location = None
 
+# クールダウン管理 (Unix Timestamp)
+cooldown_end_time = 0.0
+COOLDOWN_DURATION = 60.0  # 秒
+
 # 現在の目的地選択権を持つユーザーID (初期値: user_1)
 current_destination_selector = "user_1" 
 
@@ -443,7 +447,8 @@ async def broadcast_connection_status():
         "ready": is_ready,
         "user1": is_user1_present,
         "user2": is_user2_present,
-        "destination_selector": current_destination_selector 
+        "destination_selector": current_destination_selector,
+        "cooldown_until": cooldown_end_time  # 接続時にも現在のクールダウン情報を送る
     }
     await send_status_to_all_clients(message)
 
@@ -539,7 +544,7 @@ def kachaka_move_sync(location_id, location_name):
         return True 
 
 async def process_kachaka_queue():
-    global kachaka_client, current_location_name, current_moving_location, current_destination_selector
+    global kachaka_client, current_location_name, current_moving_location, current_destination_selector, cooldown_end_time
     current_move_future = None
 
     while True:
@@ -569,6 +574,10 @@ async def process_kachaka_queue():
                     current_destination_selector = "user_2" if current_destination_selector == "user_1" else "user_1"
                     print(f"🔄 [Role Swap] Arrived at {current_location_name}. Destination Selector is now: {current_destination_selector}")
                     
+                    # ★ クールダウン開始: 到着から60秒間操作不能にする
+                    cooldown_end_time = time.time() + COOLDOWN_DURATION
+                    print(f"⏳ Cooldown started until {datetime.fromtimestamp(cooldown_end_time).strftime('%H:%M:%S')}")
+
                     # ★ LOG: 役割交代
                     log_event("SYSTEM", "ROLE_SWAP", f"At: {current_location_name}", f"{prev_selector}->{current_destination_selector}")
                 else:
@@ -580,7 +589,8 @@ async def process_kachaka_queue():
                     "status": "idle", 
                     "message": "",
                     "current_location": current_location_name,
-                    "destination_selector": current_destination_selector
+                    "destination_selector": current_destination_selector,
+                    "cooldown_until": cooldown_end_time  # クールダウン情報を送信
                 })
                 current_move_future = None
 
@@ -630,7 +640,8 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
         "user_id": user_id,
         "message": init_msg,
         "current_location": current_location_name,
-        "destination_selector": current_destination_selector 
+        "destination_selector": current_destination_selector,
+        "cooldown_until": cooldown_end_time 
     })
 
     await broadcast_connection_status()
@@ -642,6 +653,12 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
             action = data.get("action")
 
             if action == "REQUEST_DESTINATION":
+                # ★ クールダウンチェック
+                if time.time() < cooldown_end_time:
+                     remaining = int(cooldown_end_time - time.time())
+                     await websocket.send_json({"type": "ERROR", "message": f"準備中です。あと{remaining}秒お待ちください。"})
+                     continue
+
                 if user_id != current_destination_selector:
                      await websocket.send_json({"type": "ERROR", "message": "現在あなたのターンではありません。"})
                      continue
