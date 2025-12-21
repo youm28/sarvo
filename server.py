@@ -11,14 +11,13 @@ import csv
 import os
 from datetime import datetime
 
-#カチャカのIPアドレス(研究室) 10.40.5.108
-#カチャカのIPアドレス(H509) 10.40.42.28
+# カチャカのIPアドレス
 KACHAKA_IP = "10.40.42.28"
 app = FastAPI()
 kachaka_client: kachaka_api.KachakaApiClient = None
 
 # =================================================================
-# ★★★ METRICS & LOGGING SETUP (ユーザー別集計に対応) ★★★
+# ★★★ METRICS & LOGGING SETUP ★★★
 # =================================================================
 log_lock = threading.Lock()
 current_time_str = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -26,16 +25,12 @@ LOG_FILENAME = f"experiment_metrics_{current_time_str}.csv"
 
 class MetricsTracker:
     def __init__(self):
-        # 時間計測用
         self.t_start_selection = time.time()
         self.t_dest_selected = None
         self.t_start_move = None
-
-        # サーボ集計用
-        self.servo_active_presses = {} # {user_id_axis: start_time}
-        self.current_phase = "IDLE"    # "IDLE" or "MOVING"
+        self.servo_active_presses = {} 
+        self.current_phase = "IDLE"    
         
-        # ユーザー別に集計バッファを分離
         self.servo_stats = {
             "IDLE": {
                 "user_1": {"count": 0, "duration": 0.0},
@@ -76,48 +71,32 @@ class MetricsTracker:
         return round(duration, 3)
 
     def switch_phase(self, new_phase):
-        """フェーズ切り替え時に、前のフェーズの集計をユーザーごとにログ出力"""
         if self.current_phase == new_phase: return
-
-        # 前のフェーズのデータ
         phase_data = self.servo_stats[self.current_phase]
-        
-        # ユーザーごとにログを出力
         for user_id in ["user_1", "user_2"]:
             stats = phase_data.get(user_id)
             if stats:
                 log_event(
-                    user_id, # User_IDカラムに記録
+                    user_id, 
                     f"SERVO_SUMMARY_{self.current_phase}", 
                     str(stats["count"]), 
                     str(round(stats["duration"], 3))
                 )
                 print(f"📊 Summary ({self.current_phase}) [{user_id}]: {stats['count']} clicks, {stats['duration']:.2f} sec")
-                
-                # リセット
                 stats["count"] = 0
                 stats["duration"] = 0.0
-
         self.current_phase = new_phase
 
     def record_servo_input(self, user_id, axis, command):
-        """サーボ入力の開始と終了を検知して集計（ユーザー別）"""
-        if user_id not in ["user_1", "user_2"]: return # 想定外のユーザーは無視
-
+        if user_id not in ["user_1", "user_2"]: return 
         key = f"{user_id}_{axis}"
         now = time.time()
-        
-        # 対象ユーザーの統計辞書を取得
         stats = self.servo_stats[self.current_phase][user_id]
-
         if command in ["increase", "decrease"]:
-            # 押し込み開始
             if key not in self.servo_active_presses:
                 self.servo_active_presses[key] = now
                 stats["count"] += 1
-        
         elif command == "stop":
-            # 押し込み終了
             start_time = self.servo_active_presses.pop(key, None)
             if start_time:
                 duration = now - start_time
@@ -151,7 +130,7 @@ def log_event(user_id, action_type, val1="", val2=""):
 init_log_file()
 
 # =================================================================
-# Section 1: Kachaka ロボット制御関連 (変更なし)
+# Section 1: Kachaka ロボット制御関連
 # =================================================================
 kachaka_command_queue = deque()
 kachaka_clients = set()
@@ -165,46 +144,285 @@ current_location_name = "充電ドック"
 current_moving_location = None
 current_destination_selector = "user_1" 
 
-# 経路定義
-ROUTE_PATTERNS = {
-    ("充電ドック", "1"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["e", "c", "d"]},
-    ("充電ドック", "2"): {"route_left": ["a", "d"], "route_center": ["b", "d"], "route_right": ["e", "c"]},
-    ("充電ドック", "3"): {"route_left": ["a", "d", "c"], "route_center": ["b", "c"], "route_right": ["e"]},
-    ("充電ドック", "4"): {"route_left": ["a", "d"], "route_center": ["b"], "route_right": ["e", "c", "d"]},
-    ("充電ドック", "5"): {"route_left": [], "route_center": ["b"], "route_right": ["e"]},
-    ("充電ドック", "6"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["e"]},
-    ("1", "2"): {"route_left": ["d"], "route_center": ["b", "c"], "route_right": ["a", "e", "c"]},
-    ("1", "3"): {"route_left": ["a", "e"], "route_center": ["b", "c"], "route_right": ["d", "c"]},
-    ("1", "4"): {"route_left": ["a", "b"], "route_center": ["d"], "route_right": ["d", "c", "b"]},
-    ("1", "5"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["d", "c", "e"]},
-    ("1", "6"): {"route_left": ["a"], "route_center": ["d", "b"], "route_right": ["d", "c", "e"]},
-    ("2", "1"): {"route_left": ["c", "e", "a"], "route_center": ["c", "b", "a"], "route_right": ["d"]},
-    ("2", "3"): {"route_left": ["d", "a", "e"], "route_center": ["b", "e"], "route_right": ["c"]},
-    ("2", "4"): {"route_left": ["d", "a", "b"], "route_center": ["d"], "route_right": ["c", "b"]},
-    ("2", "5"): {"route_left": ["d", "a"], "route_center": ["b"], "route_right": ["c", "e"]},
-    ("2", "6"): {"route_left": ["d", "a"], "route_center": ["b"], "route_right": ["c", "e"]},
-    ("3", "1"): {"route_left": ["e", "a"], "route_center": ["c", "b", "d"], "route_right": ["c", "d"]},
-    ("3", "2"): {"route_left": ["e", "a", "d"], "route_center": ["b", "d"], "route_right": ["c"]},
-    ("3", "4"): {"route_left": ["e", "a", "d"], "route_center": ["c", "b"], "route_right": ["c", "d"]},
-    ("3", "5"): {"route_left": ["e"], "route_center": ["c", "b"], "route_right": ["c", "d", "a"]},
-    ("3", "6"): {"route_left": ["e", "a"], "route_center": ["e"], "route_right": ["c", "b"]},
-    ("4", "1"): {"route_left": ["a"], "route_center": ["b", "a"], "route_right": ["d", "c", "e"]},
-    ("4", "2"): {"route_left": ["d", "a", "e", "c"], "route_center": ["b", "c"], "route_right": ["c"]},
-    ("4", "3"): {"route_left": ["a", "e"], "route_center": ["b", "c"], "route_right": ["c"]},
-    ("4", "5"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["c", "e"]},
-    ("4", "6"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["c", "e"]},
-    ("5", "1"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["e", "c", "d"]},
-    ("5", "2"): {"route_left": ["a", "d"], "route_center": ["b", "d"], "route_right": ["e", "c"]},
-    ("5", "3"): {"route_left": ["a", "d"], "route_center": ["c"], "route_right": ["e"]},
-    ("5", "4"): {"route_left": ["a", "d"], "route_center": ["b"], "route_right": ["e", "c"]},
-    ("5", "6"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["e"]},
-    ("6", "1"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["e", "c", "d"]},
-    ("6", "2"): {"route_left": ["a", "d"], "route_center": ["b", "4"], "route_right": ["e", "c"]},
-    ("6", "3"): {"route_left": ["a", "d", "c"], "route_center": ["e", "c"], "route_right": ["e"]},
-    ("6", "4"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["c"]},
-    ("6", "5"): {"route_left": ["a"], "route_center": ["b"], "route_right": ["e"]},
-}
+# =================================================================
+# ★★★ 経路定義 (カスタム仕様) ★★★
+# =================================================================
+
+BASE_ROUTE_PATTERNS = {}
+
+# ヘルパー関数: 複数の目的地に対して同じルートパターンを一括登録
+def register_routes(start_node, target_nodes, left, center, right):
+    for target in target_nodes:
+        BASE_ROUTE_PATTERNS[(start_node, target)] = {
+            "route_left": left,
+            "route_center": center,
+            "route_right": right
+        }
+#充電ドックからの出発
+#充電ドック -> 1~5
+register_routes("充電ドック", ["1", "2", "3", "4", "5"], 
+    left=[], 
+    center=["a", "c", "d", "b"], 
+    right=["a", "c", "e", "f", "d", "b"])
+#充電ドック -> 6~9
+register_routes("充電ドック", ["6", "7", "8", "9"], 
+    left=["a", "c"], 
+    center=["b", "d"], 
+    right=["a", "c", "e", "f", "d"])
+#充電ドック -> 10,11
+register_routes("充電ドック", ["10", "11"], 
+    left=["a", "c", "e"], 
+    center=["b", "d", "f"], 
+    right=["a", "c", "d", "f"])
+
+# --- 1からの出発 ---
+# 1 -> 2,3,4,5
+register_routes("1", ["2", "3", "4", "5"], 
+    left=[], 
+    center=["a", "c", "d", "b"], 
+    right=["a", "c", "e", "f", "d", "b"])
+
+# 1 -> 6,7,8,9
+register_routes("1", ["6", "7", "8", "9"], 
+    left=["a", "c"], 
+    center=["b", "d"], 
+    right=["a", "c", "e", "f", "d"])
+
+# 1 -> 10,11
+register_routes("1", ["10", "11"], 
+    left=["a", "c", "e"], 
+    center=["b", "d", "f"], 
+    right=["a", "c", "d", "f"])
+
+
+# --- 2からの出発 ---
+# 2 -> 1,4
+register_routes("2", ["1", "4"], 
+    left=[], 
+    center=["b", "d", "c", "a"], 
+    right=["b", "d", "f", "e", "c", "a"])
+
+# 2 -> 3,5
+register_routes("2", ["3", "5"], 
+    left=[], 
+    center=["a", "c", "d", "b"], 
+    right=["a", "c", "e", "f", "d", "b"])
+
+# 2 -> 6,8
+register_routes("2", ["6", "8"], 
+    left=["a", "c"], 
+    center=["b", "d"], 
+    right=["a", "c", "e", "f", "d"])
+
+# 2 -> 7,9
+register_routes("2", ["7", "9"], 
+    left=["b", "d"], 
+    center=["a", "c"], 
+    right=["b", "d", "f", "e", "c"])
+
+# 2 -> 10
+register_routes("2", ["10"], 
+    left=["a", "c", "e"], 
+    center=["b", "d", "f"], 
+    right=["a", "c", "d", "f"])
+
+# 2 -> 11
+register_routes("2", ["11"], 
+    left=["b", "d", "f"], 
+    center=["a", "c", "e"], 
+    right=["b", "d", "e", "c"])
+
+
+# --- 3からの出発 ---
+# 3 -> 1,2,4,5
+register_routes("3", ["1", "2", "4", "5"], 
+    left=[], 
+    center=["b", "d", "c", "a"], 
+    right=["b", "d", "f", "e", "c", "a"])
+
+# 3 -> 6,7,8,9
+register_routes("3", ["6", "7", "8", "9"], 
+    left=["b", "d"], 
+    center=["a", "c"], 
+    right=["b", "d", "f", "e", "c"])
+
+# 3 -> 10,11
+register_routes("3", ["10", "11"], 
+    left=["b", "d", "f"], 
+    center=["a", "c", "e"], 
+    right=["b", "d", "c", "e"])
+
+
+# --- 4からの出発 ---4は1と同じ
+# 4 -> 1,2,3,5
+register_routes("4", ["1", "2", "3", "5"],
+    left=[], 
+    center=["a", "c", "d", "b"], 
+    right=["a", "c", "e", "f", "d", "b"])
+# 4 -> 6,7,8,9
+register_routes("4", ["6", "7", "8", "9"], 
+    left=["a", "c"], 
+    center=["b", "d"], 
+    right=["a", "c", "e", "f", "d"])
+# 4 -> 10,11
+register_routes("4", ["10", "11"], 
+    left=["a", "c", "e"], 
+    center=["b", "d", "f"], 
+    right=["a", "c", "d", "f"])
+
+# --- 5からの出発 ---5は3と同じ
+# 5 -> 1,2,3,4
+register_routes("5", ["1", "2", "3", "4"], 
+    left=[], 
+    center=["b", "d", "c", "a"], 
+    right=["b", "d", "f", "e", "c", "a"])  
+# 5 -> 6,7,8,9
+register_routes("5", ["6", "7", "8", "9"], 
+    left=["b", "d"], 
+    center=["a", "c"], 
+    right=["b", "d", "f", "e", "c"])
+# 5 -> 10,11
+register_routes("5", ["10", "11"], 
+    left=["b", "d", "f"], 
+    center=["a", "c", "e"], 
+    right=["b", "d", "c", "e"])
+
+# --- 6からの出発 ---
+# 6 -> 1,2,3,4,5
+register_routes("6", ["1", "2", "3", "4", "5"], 
+    left=["c", "a"], 
+    center=["d", "b"], 
+    right=["c", "e", "f", "d", "b"])
+
+# 6 -> 7,8,9
+register_routes("6", ["7", "8", "9"], 
+    left=[], 
+    center=["c", "a", "b", "d"], 
+    right=["c", "e", "f", "d"])
+
+# 6 -> 10,11
+register_routes("6", ["10", "11"], 
+    left=["c", "e"], 
+    center=["d", "f"], 
+    right=["c", "a", "b", "d", "f"])
+
+
+# --- 7からの出発 ---
+# 7 -> 1,2,3,4,5
+register_routes("7", ["1", "2", "3", "4", "5"], 
+    left=["d", "b"], 
+    center=["c", "a"], 
+    right=["d", "f", "e", "c", "a"])
+
+# 7 -> 6,8,9
+register_routes("7", ["6", "8", "9"], 
+    left=[], 
+    center=["d", "b", "a", "c"], 
+    right=["d", "f", "e", "c"])
+
+# 7 -> 10,11
+register_routes("7", ["10", "11"], 
+    left=["d", "f"], 
+    center=["c", "e"], 
+    right=["d", "b", "a", "c", "e"])
+
+# --- 8からの出発 ---6と同じ
+# 8 -> 1,2,3,4,5
+register_routes("8", ["1", "2", "3", "4", "5"], 
+    left=["c", "a"], 
+    center=["d", "b"], 
+    right=["c", "e", "f", "d", "b"])
+
+# 8 -> 6,7,9
+register_routes("8", ["6", "7", "9"], 
+    left=[], 
+    center=["c", "a", "b", "d"], 
+    right=["c", "e", "f", "d"])
+
+# 8 -> 10,11
+register_routes("8", ["10", "11"], 
+    left=["c", "e"], 
+    center=["d", "f"], 
+    right=["c", "a", "b", "d", "f"])
+
+# --- 9からの出発 ---7と同じ
+# 9 -> 1,2,3,4,5
+register_routes("9", ["1", "2", "3", "4", "5"],
+    left=["d", "b"], 
+    center=["c", "a"], 
+    right=["d", "f", "e", "c", "a"])
+# 9 -> 6,7,8
+register_routes("9", ["6", "7", "8"], 
+    left=[], 
+    center=["d", "b", "a", "c"], 
+    right=["d", "f", "e", "c"])
+# 9 -> 10,11
+register_routes("9", ["10", "11"], 
+    left=["d", "f"], 
+    center=["c", "e"], 
+    right=["d", "b", "a", "c", "e"])
+
+
+# --- 10からの出発 ---
+# 10 -> 1,2,3,4,5
+register_routes("10", ["1", "2", "3", "4", "5"], 
+    left=["e", "c", "a"], 
+    center=["f", "d", "b"], 
+    right=["e", "c", "d", "b"])
+
+# 10 -> 6,7,8,9
+register_routes("10", ["6", "7", "8", "9"], 
+    left=["e", "c"], 
+    center=["f", "d"], 
+    right=["e", "c", "a", "b", "d"])
+
+# 10 -> 11
+register_routes("10", ["11"], 
+    left=[], 
+    center=["e", "c", "d", "f"], 
+    right=["e", "c", "a", "b", "d", "f"])
+
+
+# --- 11からの出発 ---
+# 11 -> 1,2,3,4,5
+register_routes("11", ["1", "2", "3", "4", "5"], 
+    left=["f", "d", "b"], 
+    center=["e", "c", "a"], 
+    right=["f", "d", "c", "a"])
+
+# 11 -> 6,7,8,9
+register_routes("11", ["6", "7", "8", "9"], 
+    left=["f", "d"], 
+    center=["e", "c"], 
+    right=["f", "d", "b", "a", "c"])
+
+# 11 -> 10
+register_routes("11", ["10"], 
+    left=[], 
+    center=["f", "d", "c", "e"], 
+    right=["f", "d", "b", "a", "c", "e"])
+
+
+# 全ての目的地リスト (1~11)
+ALL_NODES = [str(i) for i in range(1, 12)]
+START_NODES = ["充電ドック"] + ALL_NODES
+
+# ROUTE_PATTERNS を構築 (上記設定 + 自動生成)
+ROUTE_PATTERNS = BASE_ROUTE_PATTERNS.copy()
 DEFAULT_ROUTE = {"route_left": [], "route_center": [], "route_right": []}
+
+# 未定義の経路を自動生成
+for start in START_NODES:
+    for end in ALL_NODES:
+        if start == end:
+            continue
+        if (start, end) not in ROUTE_PATTERNS:
+            # マップ形状が不明なため、汎用的なパターンを設定
+            ROUTE_PATTERNS[(start, end)] = {
+                "route_left": [],     
+                "route_center": [],      
+                "route_right": []     
+            }
 
 async def send_status_to_all_clients(status_data):
     if not kachaka_clients: return
@@ -276,7 +494,6 @@ async def process_destination_and_route():
         else:
             message = f"{destination_name} へ直接向かいます！"
         
-        # ★ METRICS: 移動開始
         metrics.start_travel()
         
         log_event("SYSTEM", "START_MOVING", f"To: {destination_name}", f"Route: {route_selection}")
@@ -341,7 +558,8 @@ async def process_kachaka_queue():
                     travel_time = metrics.end_travel()
                     log_event("SYSTEM", "TIME_TRAVEL", str(travel_time), f"To: {current_location_name}")
 
-                swap_triggers = ["1", "2", "3", "4", "5", "6"]
+                # ★★★ 1~11 の目的地に到着したら交代トリガー ★★★
+                swap_triggers = [str(i) for i in range(1, 12)]
                 
                 if current_location_name in swap_triggers:
                     prev_selector = current_destination_selector
@@ -429,7 +647,6 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
                 
                 dest_name = data.get("location")["name"]
                 
-                # ★ METRICS: 目的地選択時間
                 dest_time = metrics.mark_dest_selected()
                 log_event(user_id, "TIME_DEST_SELECT", str(dest_time), dest_name)
                 
@@ -459,7 +676,6 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
                 
                 route_selection = data.get("route")
                 
-                # ★ METRICS: 経路選択時間 & 合計選択時間
                 route_time, total_time = metrics.mark_route_selected()
                 log_event(user_id, "TIME_ROUTE_SELECT", str(route_time), route_selection)
                 log_event("SYSTEM", "TIME_TOTAL_SELECT", str(total_time), "")
@@ -539,9 +755,7 @@ async def websocket_servo_endpoint(websocket: WebSocket):
             axis = data.get("axis") 
             command = data.get("command") 
 
-            # ★ METRICS: サーボ操作の集計 (逐一ログは停止)
             metrics.record_servo_input(user_id, axis, command)
-            # log_event(user_id, "SERVO_INPUT", axis, command) 
 
             if user_id not in USER_SERVO_MAP: continue
             target_servos = USER_SERVO_MAP[user_id]
