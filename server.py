@@ -146,7 +146,7 @@ current_destination_selector = "user_1"
 
 # ★★★ クールダウン管理変数の追加 ★★★
 cooldown_end_time = 0.0
-COOLDOWN_DURATION = 60.0  # 60秒待機
+COOLDOWN_DURATION = 30.0  # 30秒待機
 
 # =================================================================
 # ★★★ 経路定義 (カスタム仕様) ★★★

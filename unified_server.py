@@ -171,7 +171,7 @@ current_moving_location = None
 
 # クールダウン管理 (Unix Timestamp)
 cooldown_end_time = 0.0
-COOLDOWN_DURATION = 60.0  # 秒
+COOLDOWN_DURATION = 30.0  # 秒
 
 # 現在の目的地選択権を持つユーザーID (初期値: user_1)
 current_destination_selector = "user_1" 
