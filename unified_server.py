@@ -21,8 +21,10 @@ kachaka_client: kachaka_api.KachakaApiClient = None
 # ★★★ METRICS & LOGGING SETUP (ユーザー別集計に対応) ★★★
 # =================================================================
 log_lock = threading.Lock()
-current_time_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-LOG_FILENAME = f"baseline_metrics_{current_time_str}.csv"
+
+# ★変更: 初期状態では空にしておく（開始ボタンで設定）
+LOG_FILENAME = "" 
+is_experiment_started = False
 
 class MetricsTracker:
     def __init__(self):
@@ -125,18 +127,25 @@ class MetricsTracker:
 
 metrics = MetricsTracker()
 
+# ★変更: 呼び出された瞬間の時刻でファイルを作成する
 def init_log_file():
-    if not os.path.exists(LOG_FILENAME):
-        with open(LOG_FILENAME, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "Timestamp", "User_ID", "Action_Type", 
-                "Value_1", "Value_2", 
-                "Current_Selector", "Robot_Location"
-            ])
-    print(f"📝 Logging started: {LOG_FILENAME}")
+    global LOG_FILENAME
+    current_time_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    LOG_FILENAME = f"baseline_metrics_{current_time_str}.csv"
+    
+    print(f"📝 New Log File Created: {LOG_FILENAME}")
+
+    with open(LOG_FILENAME, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Timestamp", "User_ID", "Action_Type", 
+            "Value_1", "Value_2", 
+            "Current_Selector", "Robot_Location"
+        ])
 
 def log_event(user_id, action_type, val1="", val2=""):
+    # ファイル名が決まっていない（実験開始前）ならログしない
+    if not LOG_FILENAME: return
     try:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
         with log_lock:
@@ -149,8 +158,7 @@ def log_event(user_id, action_type, val1="", val2=""):
     except Exception as e:
         print(f"🔥 Log Error: {e}")
 
-init_log_file()
-
+# init_log_file() # ★ 起動時は作成しない（ボタン押下時に作成）
 
 # =================================================================
 # Section 1: Kachaka ロボット制御関連
@@ -448,7 +456,8 @@ async def broadcast_connection_status():
         "user1": is_user1_present,
         "user2": is_user2_present,
         "destination_selector": current_destination_selector,
-        "cooldown_until": cooldown_end_time  # 接続時にも現在のクールダウン情報を送る
+        "cooldown_until": cooldown_end_time,
+        "is_experiment_started": is_experiment_started # ★追加: 開始状態を通知
     }
     await send_status_to_all_clients(message)
 
@@ -612,7 +621,7 @@ async def process_kachaka_queue():
 
 @app.websocket("/ws/kachaka")
 async def websocket_kachaka_endpoint(websocket: WebSocket):
-    global route_selection 
+    global route_selection, is_experiment_started, metrics # ★global追加
     await websocket.accept()
     kachaka_clients.add(websocket)
     user_id = None
@@ -641,7 +650,8 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
         "message": init_msg,
         "current_location": current_location_name,
         "destination_selector": current_destination_selector,
-        "cooldown_until": cooldown_end_time 
+        "cooldown_until": cooldown_end_time,
+        "is_experiment_started": is_experiment_started # ★ 追加
     })
 
     await broadcast_connection_status()
@@ -651,6 +661,34 @@ async def websocket_kachaka_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             print(f"📨 [{user_id}] Received: {data}")
             action = data.get("action")
+
+            # ★★★ 追加: 実験開始コマンドの処理 ★★★
+            if action == "START_EXPERIMENT":
+                if user_id == "user_1": # User 1のみ権限を持つ
+                    print("🎬 Experiment START Triggered by User 1")
+                    
+                    # 1. メトリクスのリセット
+                    metrics = MetricsTracker()
+                    
+                    # 2. ログファイルの新規作成（ここで時刻が確定）
+                    init_log_file()
+                    
+                    # 3. フラグ更新
+                    is_experiment_started = True
+                    
+                    # 4. 全員に通知
+                    await send_status_to_all_clients({
+                        "type": "EXPERIMENT_STARTED",
+                        "message": "実験が開始されました！"
+                    })
+                    
+                    log_event("SYSTEM", "EXPERIMENT_START", "Button Pressed", "")
+                continue
+
+            # ★ 追加: 実験開始前は操作を受け付けない
+            if not is_experiment_started and action in ["REQUEST_DESTINATION", "SELECT_ROUTE"]:
+                 await websocket.send_json({"type": "ERROR", "message": "User 1 の開始ボタン待機中です。"})
+                 continue
 
             if action == "REQUEST_DESTINATION":
                 # ★ クールダウンチェック
