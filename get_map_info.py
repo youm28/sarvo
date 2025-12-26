@@ -3,7 +3,7 @@ import sys
 import os
 
 # IPアドレスとポート
-KACHAKA_IP = "10.40.5.97"
+KACHAKA_IP = "10.40.42.28"
 KACHAKA_PORT = 26400
 
 # 保存するファイル名
